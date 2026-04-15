@@ -1,6 +1,30 @@
 ### Analysis Pipeline (Workflow)
 ## Phase 1: Data Pre-processing & Quality Control (数据质控与清洗)
 ## qc.sh & qc2.sh: 自动化提取所有 .fastq.gz 文件执行 FastQC，并通过 MultiQC 汇总测序质量。区分了主测与补测批次。
+# Merge
+```
+#!/bin/bash
+# 1. 定义主测和补测的路径
+DIR_MAIN="/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/ML150013750"
+DIR_TOPUP="/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/ML150013680"
+OUT_DIR="/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis/01_merged_data"
+
+mkdir -p ${OUT_DIR}
+
+echo "正在将 Arg-mock-1 的主测和补测数据进行物理拼接 (cat)..."
+
+# 2. 暴力拼接 R1 文件
+cat ${DIR_MAIN}/Arg-mock-1_L1_UDI489.R1.fastq.gz \
+    ${DIR_TOPUP}/Arg-mock-1_L1_UDI489.R1.fastq.gz \
+    > ${OUT_DIR}/Arg-mock-1_merged.R1.fastq.gz
+
+# 3. 暴力拼接 R2 文件
+cat ${DIR_MAIN}/Arg-mock-1_L1_UDI489.R2.fastq.gz \
+    ${DIR_TOPUP}/Arg-mock-1_L1_UDI489.R2.fastq.gz \
+    > ${OUT_DIR}/Arg-mock-1_merged.R2.fastq.gz
+
+echo "拼接完成！产物为 Arg-mock-1_merged.R1/R2.fastq.gz"
+```
 # qc.sh
 ```
 #!/bin/bash
