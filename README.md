@@ -1,5 +1,5 @@
-### Analysis Pipeline (Workflow)
-## Phase 1: Data Pre-processing & Quality Control (数据质控与清洗)
+### Analysis Pipeline (Workflow) 
+## Phase 1: Data Pre-processing & Quality Control (数据质控与清洗) 完全没必要，下次直接用fastp，省去cat和qc
 ## qc.sh & qc2.sh: 自动化提取所有 .fastq.gz 文件执行 FastQC，并通过 MultiQC 汇总测序质量。区分了主测与补测批次。
 # Merge
 ```
@@ -216,92 +216,940 @@ cat ${MATRIX_DIR}/header.txt ${MATRIX_DIR}/raw_counts_matrix.txt > ${MATRIX_DIR}
 
 echo "🎉 ALL DONE! Ultimate Matrix saved at ${MATRIX_DIR}/final_counts.txt"
 ```
+## 注释
+#  7_annotate_matrix.py
+```
+import pandas as pd
+import re
+import os
 
+# ================= 1. 路径配置 =================
+BASE_DIR = "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+matrix_file = os.path.join(BASE_DIR, "04_counts/final_counts.txt")
+blast_file = os.path.join(BASE_DIR, "reference/tick_vs_swissprot.blast.txt")
+gff_file = os.path.join(BASE_DIR, "reference/tick_annotation.gtf")
+sample_info_file = os.path.join(BASE_DIR, "04_counts/sample_info.csv")
+output_file = os.path.join(BASE_DIR, "04_counts/annotated_comprehensive_counts.txt")
+
+# ================= 2. 解析 BLAST 结果 =================
+print("1. 提取 BLAST 详细信息...")
+blast_df = pd.read_csv(blast_file, sep='\t', header=None,
+                       names=['Protein_ID', 'SwissProt_ID', 'pident', 'length', 'mismatch', 'gapopen',
+                              'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
+
+def extract_gene_name(sp_id):
+    try: return sp_id.split('|')[-1].split('_')[0]
+    except: return "-"
+
+def extract_species(sp_id):
+    try: return sp_id.split('_')[-1]
+    except: return "-"
+
+blast_df['Protein_ID_clean'] = blast_df['Protein_ID'].apply(lambda x: x.split('.')[0])
+blast_df['Gene_Symbol'] = blast_df['SwissProt_ID'].apply(extract_gene_name)
+blast_df['Species'] = blast_df['SwissProt_ID'].apply(extract_species)
+blast_df = blast_df.drop_duplicates(subset=['Protein_ID_clean'], keep='first')
+blast_dict = blast_df.set_index('Protein_ID_clean')[['Gene_Symbol', 'Species', 'evalue', 'bitscore']].to_dict('index')
+
+# ================= 3. 解析 GTF =================
+print("2. 解析 GTF 文件...")
+loc_to_gtf = {}
+with open(gff_file, 'r') as f:
+    for line in f:
+        if line.startswith('#'): continue
+        if 'CDS' in line and 'protein_id' in line and 'gene_id' in line:
+            gene_match = re.search(r'gene_id "([^"]+)"', line)
+            prot_match = re.search(r'protein_id "([^"]+)"', line)
+            trans_match = re.search(r'transcript_id "([^"]+)"', line)
+            if gene_match and prot_match:
+                loc_id = gene_match.group(1)
+                prot_id_full = prot_match.group(1)
+                prot_id_clean = prot_id_full.split('.')[0]
+                trans_id = trans_match.group(1) if trans_match else "-"
+                loc_to_gtf[loc_id] = {'Transcript_ID': trans_id, 'Protein_ID_full': prot_id_full, 'Protein_ID_clean': prot_id_clean}
+
+# ================= 4. 处理 Sample 映射与重命名 =================
+print("3. 处理样本名精简与分组符号化 (+/-)...")
+rename_map = {}
+final_column_order = []
+
+if os.path.exists(sample_info_file):
+    sample_df = pd.read_csv(sample_info_file)
+    for _, row in sample_df.iterrows():
+        orig_id = row['Sample_ID'].strip()
+
+        # A. 提取精简 ID: 去掉 _L1_UDI 开头的后缀
+        # 例如 Arg-mock-2_L1_UDI490 -> Arg-mock-2
+        short_id = re.sub(r'_L1_UDI.*', '', orig_id)
+
+        # B. 处理 True_Group: plus -> +, minus -> -
+        group_display = row['True_Group'].replace('_plus_', '+_').replace('_minus_', '-_')
+
+        # C. 组合新名字: Group:Short_ID
+        new_name = f"{group_display}:{short_id}"
+
+        rename_map[orig_id] = new_name
+        final_column_order.append(new_name)
+else:
+    print(f"错误：未找到 {sample_info_file}")
+
+# ================= 5. 注释并重排矩阵 =================
+print("4. 组装并格式化最终矩阵...")
+matrix_df = pd.read_csv(matrix_file, sep='\t')
+matrix_df.columns = matrix_df.columns.str.strip()
+matrix_df = matrix_df.loc[:, ~matrix_df.columns.str.contains('^Unnamed')]
+
+# 插入注释列
+t_ids, p_ids, syms, specs, evals, scores = [], [], [], [], [], []
+for loc in matrix_df['Gene_ID']:
+    gtf_info = loc_to_gtf.get(loc, {})
+    p_clean = gtf_info.get('Protein_ID_clean', '-')
+    t_ids.append(gtf_info.get('Transcript_ID', '-'))
+    p_ids.append(gtf_info.get('Protein_ID_full', '-'))
+    b_info = blast_dict.get(p_clean, {})
+    syms.append(b_info.get('Gene_Symbol', '-'))
+    specs.append(b_info.get('Species', '-'))
+    evals.append(b_info.get('evalue', '-'))
+    scores.append(b_info.get('bitscore', '-'))
+
+matrix_df.insert(1, 'Transcript_ID', t_ids)
+matrix_df.insert(2, 'Protein_ID', p_ids)
+matrix_df.insert(3, 'Gene_Symbol', syms)
+matrix_df.insert(4, 'Species', specs)
+matrix_df.insert(5, 'BLAST_evalue', evals)
+matrix_df.insert(6, 'BLAST_bitscore', scores)
+
+# 执行重命名
+matrix_df.rename(columns=rename_map, inplace=True)
+
+# 强制排序
+base_cols = ['Gene_ID', 'Transcript_ID', 'Protein_ID', 'Gene_Symbol', 'Species', 'BLAST_evalue', 'BLAST_bitscore']
+# 检查重命名后的样本是否在矩阵中
+valid_samples = [name for name in final_column_order if name in matrix_df.columns]
+matrix_df = matrix_df[base_cols + valid_samples]
+
+matrix_df.to_csv(output_file, sep='\t', index=False)
+print(f"🎉 任务完成！矩阵已按 '+/-' 格式重命名并排序。")
+print(f"示例列名: {valid_samples[0] if valid_samples else 'N/A'}")
+```
 ## Phase 3: Pairwise Differential Expression (基础差异分析)
-# 3_DE_analysis.R
+# 5_annotete_DE_analysis.R
 ```
 #!/usr/bin/env Rscript
-# 加载必要的包
 library(DESeq2)
 library(ggplot2)
 
-# 1. 设置工作目录和文件路径 (请根据你的实际路径修改)
 work_dir <- "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
 setwd(work_dir)
 
-count_file <- "04_counts/final_counts.txt"
-meta_file <- "04_counts/sample_info.csv"
+out_dir <- "05_annotate"
+dir.create(out_dir, showWarnings = FALSE)
 
-# 2. 读取数据
-counts <- read.table(count_file, header=TRUE, row.names=1, check.names=FALSE)
-metadata <- read.csv(meta_file, row.names=1)
+count_file <- "04_counts/annotated_comprehensive_counts.txt"
+meta_file <- "sample_info.csv" 
 
-# 确保 count 矩阵的列名和 metadata 的行名顺序完全一致
+# =========================================================================
+# 2. 读取并拆分数据
+# =========================================================================
+data <- read.table(count_file, header=TRUE, sep="\t", quote="", stringsAsFactors=FALSE, check.names=FALSE)
+
+anno <- data[, 1:7]
+rownames(anno) <- anno$Gene_ID
+counts <- data[, 8:ncol(data)]
+rownames(counts) <- data$Gene_ID
+
+# 读取 metadata
+metadata <- read.csv(meta_file, row.names=1) 
+
+# 【修复核心 1】：仅修改 metadata 的行名来对齐矩阵，但保持 True_Group 列内容为英文！
+short_ids <- gsub("_L1_UDI.*", "", rownames(metadata))
+# 模拟 Python 里的显示名字
+group_display <- gsub("_plus_", "+_", metadata$True_Group)
+group_display <- gsub("_minus_", "-_", group_display)
+
+# 赋予新行名以匹配 count 矩阵
+rownames(metadata) <- paste0(group_display, ":", short_ids)
+
 counts <- counts[, rownames(metadata)]
 stopifnot(all(colnames(counts) == rownames(metadata)))
 
+# =========================================================================
 # 3. 构建 DESeq2 对象
-# 我们使用 True_Group 作为分组进行比较，这样最直接
+# =========================================================================
+# 此时 metadata$True_Group 依然是安全的 "Arg_plus_LGTV"，不会引发报错
 dds <- DESeqDataSetFromMatrix(countData = counts,
                               colData = metadata,
                               design = ~ True_Group)
 
-# 过滤低表达基因 (至少在3个样本中 counts >= 10)
 keep <- rowSums(counts(dds) >= 10) >= 3
 dds <- dds[keep,]
-
-# 4. 运行差异表达分析
 dds <- DESeq(dds)
 
-# 5. 提取你关心的对比组结果 (示例)
-# 提取结果的函数，可以按需调用
+# =========================================================================
+# 5. 提取差异结果
+# =========================================================================
 get_de_results <- function(dds, group1, group2, prefix) {
-  # 注意：对比顺序是 group1 vs group2 (group1 相对于 group2 的变化)
   res <- results(dds, contrast=c("True_Group", group1, group2))
-  res_ordered <- res[order(res$padj),]
-
-  # 导出 CSV
-  write.csv(as.data.frame(res_ordered),
-            file=paste0("04_counts/DE_", prefix, "_", group1, "_vs_", group2, ".csv"))
-
-  # 简单统计显著差异基因 (padj < 0.05 & |log2FC| > 1)
+  res_df <- as.data.frame(res)
+  
+  res_df <- cbind(anno[rownames(res_df), c("Gene_Symbol", "Species", "BLAST_evalue")], res_df)
+  res_ordered <- res_df[order(res_df$padj),]
+  
+  out_file <- file.path(out_dir, paste0("DE_", prefix, "_", group1, "_vs_", group2, ".csv"))
+  write.csv(res_ordered, file=out_file)
+  
   sig_up <- sum(res$padj < 0.05 & res$log2FoldChange > 0.58, na.rm=TRUE)
   sig_down <- sum(res$padj < 0.05 & res$log2FoldChange < -0.58 , na.rm=TRUE)
   cat(sprintf("Comparison: %s vs %s -> Up: %d, Down: %d\n", group1, group2, sig_up, sig_down))
 }
 
-# --- 在这里定义你需要比较的组合 ---
+# 【修复核心 2】：调用比较组时，用回英文字母
+get_de_results(dds, "Arg_plus_LGTV", "Arg_plus_mock", "LGTV_in_ArgPlus")
+get_de_results(dds, "Arg_minus_LGTV", "Arg_minus_mock", "LGTV_in_ArgMinus")
+get_de_results(dds, "Arg_plus_LGTV", "Arg_minus_LGTV", "ArgPlus_vs_ArgMinus_in_LGTV")
 
-# 示例 1：在 Arg+ 背景下，LGTV 感染 vs mock
-get_de_results(dds, "Arg_plus_LGTV", "Arg_plus_mock", "ArgPlus")
+get_de_results(dds, "Arg_plus_SFTSV", "Arg_plus_mock", "SFTSV_in_ArgPlus")
+get_de_results(dds, "Arg_minus_SFTSV", "Arg_minus_mock", "SFTSV_in_ArgMinus")
+get_de_results(dds, "Arg_plus_SFTSV", "Arg_minus_SFTSV", "ArgPlus_vs_ArgMinus_in_SFTSV")
 
-# 示例 2：在 Arg- 背景下，LGTV 感染 vs mock
-get_de_results(dds, "Arg_minus_LGTV", "Arg_minus_mock", "ArgMinus")
-
-# 示例 3：LGTV 感染下，Arg+ vs Arg- (看突变效应)
-get_de_results(dds, "Arg_plus_LGTV", "Arg_minus_LGTV", "LGTV_infection")
-
-# 对 SFTSV 的比较
-get_de_results(dds, "Arg_plus_SFTSV", "Arg_plus_mock", "ArgPlus")
-get_de_results(dds, "Arg_minus_SFTSV", "Arg_minus_mock", "ArgMinus")
-
-# 6. PCA 图评估样本聚类 (检查样本是否聚类合理，以及 1号和9号修正后是否和其他重复聚在一起)
+# =========================================================================
+# 6. PCA 降维分析
+# =========================================================================
 vsd <- vst(dds, blind=FALSE)
 pcaData <- plotPCA(vsd, intgroup=c("True_Group", "Genotype", "Treatment"), returnData=TRUE)
 percentVar <- round(100 * attr(pcaData, "percentVar"))
 
-pdf("04_counts/PCA_plot.pdf", width=8, height=6)
-ggplot(pcaData, aes(PC1, PC2, color=True_Group, shape=Genotype)) +
-  geom_point(size=3) +
-  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
-  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
-  theme_minimal() +
-  ggtitle("PCA Plot (Corrected Labels)")
+pdf(file.path(out_dir, "PCA_plot.pdf"), width=8, height=6)
+print(
+  ggplot(pcaData, aes(PC1, PC2, color=True_Group, shape=Genotype)) +
+    geom_point(size=4, alpha=0.8) +
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    theme_bw() + 
+    ggtitle("PCA Plot of Arg +/- with LGTV/SFTSV Infection") +
+    theme(plot.title = element_text(hjust = 0.5, face="bold"))
+)
 dev.off()
 
-cat("🎉 Differential Expression Analysis Setup Complete. Check 04_counts directory for CSVs and PCA plot.\n")
+cat("🎉 差异分析结束！请检查 05_annotate 目录。\n")
+```
+## 热图
+# 17.R
+```
+#!/usr/bin/env Rscript
+# =====================================================================
+# 终极版 DEG FC 热图 (细节拉满：去 variant 前缀 + 限高 + 极致去冗余 + 样本严格序号化)
+# =====================================================================
+
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!requireNamespace("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
+
+library(pheatmap)
+library(DESeq2)
+library(grid)
+
+# 1. 路径设置
+work_dir <- "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+setwd(work_dir)
+
+count_file <- "04_counts/annotated_comprehensive_counts.txt"
+meta_file  <- "04_counts/sample_info.csv"
+gtf_file   <- "reference/tick_annotation.gtf"
+de_dir     <- "05_annotate"
+out_dir    <- "06_heatmaps"
+dir.create(out_dir, showWarnings = FALSE)
+
+# =====================================================================
+# 1.5 提取 GTF 功能描述字典
+# =====================================================================
+message("🔍 正在扫描 GTF 提取基因功能描述...")
+gtf_lines <- readLines(gtf_file)
+gtf_lines <- gtf_lines[grepl("product", gtf_lines)]
+locs <- sub('.*gene_id "([^"]+)".*', '\\1', gtf_lines)
+prods <- ifelse(grepl('product "', gtf_lines),
+                sub('.*product "([^"]+)".*', '\\1', gtf_lines),
+                NA)
+
+loc_to_product <- data.frame(LOC = locs, Product = prods)
+loc_to_product <- loc_to_product[!duplicated(loc_to_product$LOC), ]
+rownames(loc_to_product) <- loc_to_product$LOC
+
+# =====================================================================
+# 2. 读取数据并执行【绝对无错对齐】
+# =====================================================================
+message("📦 正在读取并进行数据对齐...")
+data <- read.table(count_file, header=TRUE, sep="\t", quote="", stringsAsFactors=FALSE, check.names=FALSE)
+counts_raw <- data[, 8:ncol(data)]
+rownames(counts_raw) <- data$Gene_ID
+
+metadata <- read.csv(meta_file, stringsAsFactors = FALSE)
+metadata$True_Group <- factor(metadata$True_Group)
+
+# 3. 处理显示名字 (Group:Name)
+metadata$Sample_ID <- sub("_L1_UDI.*", "", metadata$Sample_ID)
+metadata$Sample_ID <- sub("_merged$", "", metadata$Sample_ID)
+metadata$Group_Disp <- gsub("_plus_", "+_",as.character(metadata$True_Group))
+metadata$Group_Disp <- gsub("_minus_", "-_", metadata$Group_Disp)
+
+rownames(metadata) <- paste0(metadata$Group_Disp, ":", metadata$Sample_ID)
+
+count_names <- colnames(counts_raw)
+meta_names <- rownames(metadata)
+if (!setequal(count_names, meta_names)) stop("counts 和 metadata 样本名不一致！")
+counts_raw <- counts_raw[, meta_names]
+
+# =====================================================================
+# 3. VST 转换与画图核心
+# =====================================================================
+dds <- DESeqDataSetFromMatrix(countData = counts_raw, colData = metadata, design = ~ True_Group)
+vsd <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vsd)
+
+plot_fc_heatmap <- function(de_file_name, group_test, group_control, title_name, fc_cutoff=1.5, pvalue_cutoff=0.05, padj_cutoff=0.05) {
+  pretty_name <- function(x) {
+    x <- gsub("_plus_", "+", x)
+    x <- gsub("_minus_", "-", x)
+    x <- gsub("_", " ", x)
+    return(x)
+  }
+
+  de_file <- file.path(de_dir, de_file_name)
+  if (!file.exists(de_file)) return(NULL)
+
+  res <- read.csv(de_file, row.names = 1, stringsAsFactors = FALSE)
+
+  sig <- res[!is.na(res$pvalue) & res$pvalue < pvalue_cutoff &
+             !is.na(res$padj) & res$padj < padj_cutoff &
+             !is.na(res$log2FoldChange) & abs(res$log2FoldChange) > log2(fc_cutoff), ]
+
+  target_genes <- rownames(sig)
+  if(length(target_genes) < 2) return(NULL)
+
+  cols_control <- rownames(metadata)[metadata$True_Group == group_control]
+  cols_test    <- rownames(metadata)[metadata$True_Group == group_test]
+  expr <- vst_matrix[target_genes, c(cols_control, cols_test), drop = FALSE]
+
+  control_mean <- rowMeans(expr[, cols_control, drop = FALSE])
+  expr_fc <- expr - control_mean
+
+  # --- 修复样本命名逻辑 ---
+  # 先提取出纯粹的组名 (比如 Arg-SFTSV)
+  base_colnames <- sapply(colnames(expr_fc), function(x) {
+    g <- strsplit(x, ":")[[1]][1]
+    g <- gsub("_", "", g)
+    return(g)
+  })
+
+  # 对相同的组名，统一按照出现顺序加上 .1, .2, .3
+  colnames(expr_fc) <- unname(ave(base_colnames, base_colnames, FUN = function(x) paste0(x, ".", seq_along(x))))
+
+  # --- 行名解析与清洗 ---
+  new_rownames <- sapply(target_genes, function(loc) {
+    sym <- sig[loc, "Gene_Symbol"]
+    spec <- sig[loc, "Species"]
+    prod <- if(loc %in% rownames(loc_to_product)) loc_to_product[loc, "Product"] else ""
+
+    if (!is.na(sym) && sym != "-" && sym != "" && !grepl("^LOC", sym)) {
+      if (!is.na(spec) && spec != "-" && spec != "") return(paste0(sym, " (", spec, ")"))
+      return(sym)
+    }
+
+    if (!is.na(prod) && prod != "") {
+      # 抹除前缀
+      prod <- sub("^uncharacterized LOC[0-9]+,\\s*", "", prod)
+      prod <- sub("^LOC[0-9]+,\\s*", "", prod)
+      prod <- gsub("uncharacterized protein ", "", prod)
+      prod <- gsub("isoform X.*", "", prod)
+      # 抹除 transcript variant 等冗余后缀（包含前面的逗号和空格）
+      prod <- gsub(",?\\s*transcript variant.*", "", prod, ignore.case = TRUE)
+      # 去除两端可能多余的空格
+      prod <- trimws(prod)
+
+      # 清理后，如果变为空，或依然是 LOC/hypothetical，返回 NA
+      if (prod == "" || grepl("^uncharacterized LOC", prod) || grepl("^LOC", prod) || grepl("^hypothetical", prod, ignore.case = TRUE)) {
+        return(NA)
+      } else {
+        if (nchar(prod) > 45) prod <- paste0(substr(prod, 1, 42), "...")
+        return(prod)
+      }
+    }
+    return(NA)
+  })
+
+  valid_idx <- !is.na(new_rownames)
+  expr_fc <- expr_fc[valid_idx, , drop = FALSE]
+  new_rownames <- new_rownames[valid_idx]
+  target_genes <- target_genes[valid_idx]
+
+  if(nrow(expr_fc) < 2) {
+    message("⚠️ ", title_name, " 剔除无注释基因后不足2个，跳过...")
+    return(NULL)
+  }
+
+  rownames(expr_fc) <- make.unique(as.character(new_rownames))
+  ctrl_name <- pretty_name(group_control)
+  test_name <- pretty_name(group_test)
+
+  anno_colors <- list(
+    Group = setNames(
+      c("#3B4CC0", "#B40426"),
+      c(ctrl_name, test_name)
+    )
+  )
+
+  my_color <- colorRampPalette(c("navy", "white", "firebrick3"))(100)
+
+  cap_value <- quantile(abs(expr_fc), 0.98, na.rm = TRUE)
+  if(cap_value == 0) cap_value <- max(abs(expr_fc), na.rm = TRUE)
+  expr_fc[expr_fc > cap_value] <- cap_value
+  expr_fc[expr_fc < -cap_value] <- -cap_value
+
+  max_scale <- max(abs(expr_fc), na.rm = TRUE)
+  my_breaks <- seq(-max_scale, max_scale, length.out = 101)
+
+  # 计算高度，并限制最大高度不超过 40 英寸，防止过度拉伸
+  plot_height <- max(8, nrow(expr_fc) * 0.16)
+  plot_height <- min(plot_height, 40)
+
+  anno_col <- data.frame(
+    Group = c(
+      rep(ctrl_name, length(cols_control)),
+      rep(test_name, length(cols_test))
+    )
+  )
+  rownames(anno_col) <- colnames(expr_fc)
+
+  ph <- pheatmap(
+                 expr_fc,
+                 scale = "none", cluster_rows = TRUE, cluster_cols = TRUE,
+                 annotation_col = anno_col, annotation_colors = anno_colors,
+                 color = my_color, breaks = my_breaks,
+                 show_rownames = TRUE, fontsize_row = 8, fontsize_col = 10,
+                 angle_col = 45, cellwidth = 25,
+                 main = paste0(
+                    title_name,
+                    "\n", pretty_name(group_test), " vs ", pretty_name(group_control),
+                    " | log2FC>",round(log2(fc_cutoff),2),
+                    " | p<", pvalue_cutoff,
+                    " | padj<", padj_cutoff,
+                    " | n=", length(target_genes)
+                 ),
+                 silent = TRUE)
+
+  out_pdf <- file.path(out_dir, paste0("Heatmap_FC_", gsub(" ", "_", title_name), ".pdf"))
+  pdf(out_pdf, width = 14, height = plot_height)
+  grid::grid.newpage()
+  grid::grid.draw(ph$gtable)
+  dev.off()
+  message("✅ 成功生成: ", out_pdf, " (展示 ", length(target_genes), " 个有效基因)")
+}
+
+# =====================================================================
+# 4. 执行绘图
+# =====================================================================
+plot_fc_heatmap("DE_LGTV_in_ArgPlus_Arg_plus_LGTV_vs_Arg_plus_mock.csv", "Arg_plus_LGTV", "Arg_plus_mock", "Arg+ LGTV vs Mock", fc_cutoff=2, pvalue_cutoff=0.05, padj_cutoff=0.05)
+plot_fc_heatmap("DE_LGTV_in_ArgMinus_Arg_minus_LGTV_vs_Arg_minus_mock.csv", "Arg_minus_LGTV", "Arg_minus_mock", "Arg- LGTV vs Mock", fc_cutoff=1.2, pvalue_cutoff=0.05, padj_cutoff=0.05)
+plot_fc_heatmap("DE_SFTSV_in_ArgPlus_Arg_plus_SFTSV_vs_Arg_plus_mock.csv", "Arg_plus_SFTSV", "Arg_plus_mock", "Arg+ SFTSV vs Mock", fc_cutoff=2, pvalue_cutoff=0.05, padj_cutoff=0.05)
+plot_fc_heatmap("DE_SFTSV_in_ArgMinus_Arg_minus_SFTSV_vs_Arg_minus_mock.csv", "Arg_minus_SFTSV", "Arg_minus_mock", "Arg- SFTSV vs Mock", fc_cutoff=3, pvalue_cutoff=0.01, padj_cutoff=0.01)
+plot_fc_heatmap("DE_ArgPlus_vs_ArgMinus_in_LGTV_Arg_plus_LGTV_vs_Arg_minus_LGTV.csv", "Arg_plus_LGTV", "Arg_minus_LGTV", "LGTV (Arg+ vs Arg-)", fc_cutoff=1.5, pvalue_cutoff=0.05, padj_cutoff=0.05)
+plot_fc_heatmap("DE_ArgPlus_vs_ArgMinus_in_SFTSV_Arg_plus_SFTSV_vs_Arg_minus_SFTSV.csv", "Arg_plus_SFTSV", "Arg_minus_SFTSV", "SFTSV (Arg+ vs Arg-)", fc_cutoff=3, pvalue_cutoff=0.01, padj_cutoff=0.01)
+
+message("\n🎉 全部结束！所有样本已实现整齐划一的 .1 / .2 / .3 编号。")
+
 ```
 
+
+## KEGG&GO
+# enrichmeng.R
+```
+#!/usr/bin/env Rscript
+# =====================================================================
+# 非模式生物(蜱虫)借助同源基因(Human)进行 GO & KEGG 自动化富集分析
+# =====================================================================
+
+# 安装必要的包 (如果还没装的话)
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) BiocManager::install("clusterProfiler")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+
+# 1. 路径设置
+work_dir <- "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+setwd(work_dir)
+
+de_dir <- "05_annotate"
+out_dir <- "07_enrichment"
+dir.create(out_dir, showWarnings = FALSE)
+
+# =====================================================================
+# 2. 核心分析函数：输入DE表，输出GO/KEGG结果和全套图表
+# =====================================================================
+run_enrichment <- function(de_file_name, prefix_name, fc_cutoff=1.5, pvalue_cutoff=0.05) {
+
+  message("\n=======================================================")
+  message("🚀 开始处理分析组: ", prefix_name)
+
+  de_file <- file.path(de_dir, de_file_name)
+  if (!file.exists(de_file)) {
+    message("⚠️ 找不到文件: ", de_file, "，跳过。")
+    return(NULL)
+  }
+
+  # 读取差异结果并筛选显著 DEG
+  res <- read.csv(de_file, row.names = 1, stringsAsFactors = FALSE)
+  sig <- res[!is.na(res$pvalue) & res$pvalue < pvalue_cutoff &
+             !is.na(res$log2FoldChange) & abs(res$log2FoldChange) > log2(fc_cutoff), ]
+
+  if (nrow(sig) == 0) {
+    message("⚠️ ", prefix_name, " 没有显著差异基因，跳过。")
+    return(NULL)
+  }
+
+  # 提取合法的 Gene Symbol 并【全部大写】以匹配人类数据库
+  symbols <- sig$Gene_Symbol
+  symbols <- symbols[!is.na(symbols) & symbols != "" & symbols != "-"]
+  symbols <- toupper(symbols)
+  symbols <- unique(symbols)
+
+  if (length(symbols) < 5) {
+    message("⚠️ ", prefix_name, " 拥有合法 Symbol 的基因太少(<5)，做富集没意义，跳过。")
+    return(NULL)
+  }
+
+  # ---------------------------------------------------------
+  # ID 转换: SYMBOL -> ENTREZID
+  # ---------------------------------------------------------
+  message("🔄 正在将 Symbol 转换为 Entrez ID...")
+  gene_df <- bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+  if (nrow(gene_df) == 0) {
+    message("⚠️ ", prefix_name, " 未能成功匹配到任何 Human Entrez ID，跳过。")
+    return(NULL)
+  }
+
+  target_entrez <- gene_df$ENTREZID
+
+  # =====================================================================
+  # 3. GO 富集分析 & 绘图
+  # =====================================================================
+  message("🧬 正在运行 GO 富集分析...")
+  go <- enrichGO(
+    gene          = target_entrez,
+    OrgDb         = org.Hs.eg.db,
+    ont           = "all",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+
+  if (!is.null(go) && nrow(go@result[go@result$p.adjust < 0.05, ]) > 0) {
+    # 保存表格
+    write.csv(go@result, file = file.path(out_dir, paste0(prefix_name, "_GO_results.csv")))
+
+    # 画图：为了防止报错，加个简单的 trycatch
+    tryCatch({
+      # 3.1 柱状图
+      p1 <- barplot(go, showCategory = 20, color = "pvalue", label_format = 100) + ggtitle(paste0(prefix_name, " - GO 富集分析柱状图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_GO_barplot.pdf")), p1, width = 10, height = 8)
+
+      # 3.2 气泡图
+      p2 <- dotplot(go, showCategory = 20, color = "pvalue", label_format = 100) + ggtitle(paste0(prefix_name, " - GO 富集分析气泡图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_GO_dotplot.pdf")), p2, width = 10, height = 8)
+
+      # 3.3 按分类拆分柱状图
+      p3 <- barplot(go, drop = TRUE, showCategory = 10, split = "ONTOLOGY", label_format = 100, color = "pvalue") +
+            facet_grid(ONTOLOGY~., scale = 'free') + ggtitle(paste0(prefix_name, " - GO 分类柱状图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_GO_split_barplot.pdf")), p3, width = 12, height = 10)
+
+      # 3.4 按分类拆分气泡图
+      p4 <- dotplot(go, showCategory = 10, split = "ONTOLOGY", label_format = 100, color = "pvalue") +
+            facet_grid(ONTOLOGY~., scale = 'free') + ggtitle(paste0(prefix_name, " - GO 分类气泡图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_GO_split_dotplot.pdf")), p4, width = 12, height = 10)
+
+      message("✅ GO 可视化完成！")
+    }, error = function(e) { message("⚠️ GO 画图失败: ", e$message) })
+  } else {
+    message("⚠️ ", prefix_name, " 没有显著富集的 GO 条目。")
+  }
+
+  # =====================================================================
+  # 4. KEGG 富集分析 & 绘图
+  # =====================================================================
+  message("🧪 正在运行 KEGG 富集分析...")
+  kegg <- enrichKEGG(
+    gene          = target_entrez,
+    organism      = 'hsa',
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.5, # 注意：KEGG较难富集，你这里设了 0.5 作为阈值，建议如果出图太多可以调回 0.05
+    qvalueCutoff  = 0.5
+  )
+
+  if (!is.null(kegg) && nrow(kegg@result) > 0) {
+    kegg <- setReadable(kegg, OrgDb = org.Hs.eg.db, keyType = 'ENTREZID')
+    write.csv(kegg@result, file = file.path(out_dir, paste0(prefix_name, "_KEGG_results.csv")))
+
+    tryCatch({
+      # 4.1 KEGG 柱状图
+      pk1 <- barplot(kegg, drop = TRUE, showCategory = 15, label_format = 50, color = "pvalue") + ggtitle(paste0(prefix_name, " - KEGG 富集分析柱状图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_KEGG_barplot.pdf")), pk1, width = 10, height = 8)
+
+      # 4.2 KEGG 气泡图
+      pk2 <- dotplot(kegg, showCategory = 20, orderBy = "GeneRatio", label_format = 50, color = "pvalue") + ggtitle(paste0(prefix_name, " - KEGG 富集分析气泡图"))
+      ggsave(file.path(out_dir, paste0(prefix_name, "_KEGG_dotplot.pdf")), pk2, width = 10, height = 8)
+
+      message("✅ KEGG 可视化完成！")
+    }, error = function(e) { message("⚠️ KEGG 画图失败: ", e$message) })
+  } else {
+    message("⚠️ ", prefix_name, " 没有显著富集的 KEGG 通路。")
+  }
+}
+
+# =====================================================================
+# 5. 批量执行
+# =====================================================================
+# 注意这里的 FC 和 P 值过滤标准要和你前一步热图画图时保持一致
+run_enrichment("DE_LGTV_in_ArgPlus_Arg_plus_LGTV_vs_Arg_plus_mock.csv", "ArgPlus_LGTV_vs_Mock", fc_cutoff=2)
+run_enrichment("DE_SFTSV_in_ArgPlus_Arg_plus_SFTSV_vs_Arg_plus_mock.csv", "ArgPlus_SFTSV_vs_Mock", fc_cutoff=2)
+run_enrichment("DE_ArgPlus_vs_ArgMinus_in_LGTV_Arg_plus_LGTV_vs_Arg_minus_LGTV.csv", "LGTV_ArgPlus_vs_ArgMinus", fc_cutoff=1.5)
+run_enrichment("DE_ArgPlus_vs_ArgMinus_in_SFTSV_Arg_plus_SFTSV_vs_Arg_minus_SFTSV.csv", "SFTSV_ArgPlus_vs_ArgMinus", fc_cutoff=3)
+
+message("\n🎉 富集分析全部结束！所有的 CSV 表格和精美的 PDF 气泡图/柱状图都保存在了 07_enrichment 目录下！")
+
+```
+## venn
+# 15_four_way_venn.R
+```
+#!/usr/bin/env Rscript
+# =====================================================================
+# 终极经典韦恩图：(四圈独立纯色叠加 + 对称排版 + 无百分比 + 精准四组提取)
+# =====================================================================
+
+# 安装经典韦恩图包
+if (!requireNamespace("VennDiagram", quietly = TRUE)) install.packages("VennDiagram", repos = "https://cloud.r-project.org")
+
+library(VennDiagram)
+library(grid)
+
+# 关闭 VennDiagram 默认的繁琐日志输出
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+# 1. 路径设置
+work_dir <- "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+setwd(work_dir)
+
+de_dir <- "05_annotate"
+out_dir <- "09_four_way_venn"
+dir.create(out_dir, showWarnings = FALSE)
+
+# =====================================================================
+# 2. 读取四个核心对比组数据
+# =====================================================================
+message("📦 正在加载四个核心对比组的数据...")
+
+f_lgtv_v  <- file.path(de_dir, "DE_LGTV_in_ArgPlus_Arg_plus_LGTV_vs_Arg_plus_mock.csv")
+f_sftsv_v <- file.path(de_dir, "DE_SFTSV_in_ArgPlus_Arg_plus_SFTSV_vs_Arg_plus_mock.csv")
+f_lgtv_a  <- file.path(de_dir, "DE_ArgPlus_vs_ArgMinus_in_LGTV_Arg_plus_LGTV_vs_Arg_minus_LGTV.csv")
+f_sftsv_a <- file.path(de_dir, "DE_ArgPlus_vs_ArgMinus_in_SFTSV_Arg_plus_SFTSV_vs_Arg_minus_SFTSV.csv")
+
+res_lgtv_v  <- read.csv(f_lgtv_v, row.names = 1, stringsAsFactors = FALSE)
+res_sftsv_v <- read.csv(f_sftsv_v, row.names = 1, stringsAsFactors = FALSE)
+res_lgtv_a  <- read.csv(f_lgtv_a, row.names = 1, stringsAsFactors = FALSE)
+res_sftsv_a <- read.csv(f_sftsv_a, row.names = 1, stringsAsFactors = FALSE)
+
+# =====================================================================
+# 3. 提取目标基因集 (全部采用绝对值 abs()，提取所有“差异基因”)
+# =====================================================================
+message("🎯 正在执行差异基因阈值筛选 (包含上调与下调)...")
+
+genes_lgtv_v <- rownames(res_lgtv_v[!is.na(res_lgtv_v$pvalue) & res_lgtv_v$pvalue < 0.05 &
+                                    !is.na(res_lgtv_v$log2FoldChange) & abs(res_lgtv_v$log2FoldChange) > log2(1.5), ])
+
+genes_sftsv_v <- rownames(res_sftsv_v[!is.na(res_sftsv_v$pvalue) & res_sftsv_v$pvalue < 0.05 &
+                                      !is.na(res_sftsv_v$log2FoldChange) & abs(res_sftsv_v$log2FoldChange) > log2(1.5), ])
+
+genes_lgtv_a <- rownames(res_lgtv_a[!is.na(res_lgtv_a$pvalue) & res_lgtv_a$pvalue < 0.05 &
+                                    !is.na(res_lgtv_a$log2FoldChange) & abs(res_lgtv_a$log2FoldChange) > log2(1.5), ])
+
+genes_sftsv_a <- rownames(res_sftsv_a[!is.na(res_sftsv_a$pvalue) & res_sftsv_a$pvalue < 0.05 &
+                                      !is.na(res_sftsv_a$log2FoldChange) & abs(res_sftsv_a$log2FoldChange) > log2(1.5), ])
+
+# 【亮点设计：完美对称排版】
+# 按照 1、4 为外圈，2、3 为内圈的绘图逻辑，我们这样排列就能实现左右对称！
+venn_list <- list(
+  "Arg+(LGTV vs mock)"  = genes_lgtv_v,   # 左外圈
+  "LGTV(Arg+ vs Arg-)"    = genes_lgtv_a,   # 左内圈
+  "SFTSV(Arg+ vs Arg-)"   = genes_sftsv_v,  # 右内圈
+  "Arg+(SFTSV vs mock)" = genes_sftsv_a   # 右外圈
+)
+
+# =====================================================================
+# 4. 绘制经典四圈韦恩图
+# =====================================================================
+message("🎨 正在绘制四个大圈独立着色的经典韦恩图...")
+
+# 定义四个大圈的颜色（LGTV用暖色红黄，SFTSV用冷色蓝绿，对比分明）
+my_colors <- c("#E41A1C", "#FF7F00", "#377EB8", "#4DAF4A")
+
+venn.plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL,
+  col = "transparent",          # 隐藏边框线，让颜色更纯粹
+  fill = my_colors,             # 四个圈四种独立颜色
+  alpha = 0.5,                  # 半透明叠加，中间交集会自动加深
+  label.col = "black",          # 数字颜色
+  cex = 1.3,                    # 数字大小 (只有count，没有百分比)
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.col = my_colors,          # 标题颜色与圈颜色一致
+  cat.cex = 1.1,
+  cat.fontface = "bold",
+  cat.fontfamily = "sans",
+  margin = 0.1
+)
+
+pdf_file <- file.path(out_dir, "Four_Way_Venn_Classic_Symmetric.pdf")
+pdf(pdf_file, width = 9, height = 8)
+grid.draw(venn.plot)
+dev.off()
+message("✅ 经典韦恩图保存成功: ", pdf_file)
+
+# =====================================================================
+# 5. 精准提取你要求的 4 个交集
+# =====================================================================
+extract_detailed_info <- function(target_genes, file_name) {
+  if (length(target_genes) == 0) {
+    message("⚠️ 交集 [", file_name, "] 无基因，跳过导出。")
+    return()
+  }
+
+  target_cols <- c("Gene_Symbol", "Species")
+  actual_cols <- intersect(target_cols, colnames(res_lgtv_v))
+  df <- res_lgtv_v[target_genes, actual_cols, drop = FALSE]
+
+  df$LGTV_Virus_log2FC <- res_lgtv_v[target_genes, "log2FoldChange"]
+  df$LGTV_Arg_log2FC   <- res_lgtv_a[target_genes, "log2FoldChange"]
+  df$SFTSV_Virus_log2FC <- res_sftsv_v[target_genes, "log2FoldChange"]
+  df$SFTSV_Arg_log2FC   <- res_sftsv_a[target_genes, "log2FoldChange"]
+
+  csv_path <- file.path(out_dir, paste0(file_name, ".csv"))
+  write.csv(df, csv_path, row.names = TRUE)
+  message("  - 💾 成功导出表: ", file_name, ".csv (共 ", length(target_genes), " 个基因)")
+}
+
+message("📊 正在严格按照您的 4 个条件提取核心交集数据...")
+
+# 目标 1: LGTV vs MOCK 和 LGTV_Arg 的交集
+int_1 <- intersect(genes_lgtv_v, genes_lgtv_a)
+extract_detailed_info(int_1, "Target_1_LGTV_Virus_AND_LGTV_Arg")
+
+# 目标 2: SFTSV vs MOCK 和 SFTSV_Arg 的交集
+int_2 <- intersect(genes_sftsv_v, genes_sftsv_a)
+extract_detailed_info(int_2, "Target_2_SFTSV_Virus_AND_SFTSV_Arg")
+
+# 目标 3: LGTV vs MOCK 和 SFTSV vs MOCK 的交集
+int_3 <- intersect(genes_lgtv_v, genes_sftsv_v)
+extract_detailed_info(int_3, "Target_3_LGTV_Virus_AND_SFTSV_Virus")
+
+# 目标 4: 四者的终极交集 (即：LGTV_Virus ∩ SFTSV_Virus ∩ LGTV_Arg ∩ SFTSV_Arg)
+int_4 <- Reduce(intersect, list(genes_lgtv_v, genes_sftsv_v, genes_lgtv_a, genes_sftsv_a))
+extract_detailed_info(int_4, "Target_4_Ultimate_All_Four")
+
+message("\n🎉 逻辑已彻底理顺！请查阅 09_four_way_venn 文件夹！")
+
+```
+## 靶点基因箱型图
+# 
+```
+#!/usr/bin/env Rscript
+# =====================================================================
+# 核心基因表达图 (终极大满贯版：全组别 P 值闭环 + SCI 柳叶刀风格)
+# =====================================================================
+
+if (!requireNamespace("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2", repos = "https://cloud.r-project.org")
+if (!requireNamespace("reshape2", quietly = TRUE)) install.packages("reshape2", repos = "https://cloud.r-project.org")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos = "https://cloud.r-project.org")
+if (!requireNamespace("ggsci", quietly = TRUE)) install.packages("ggsci", repos = "https://cloud.r-project.org")
+
+library(DESeq2)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(ggsci)
+
+# 1. 路径设置
+work_dir <- "/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+setwd(work_dir)
+
+count_file <- "04_counts/annotated_comprehensive_counts.txt"
+meta_file  <- "04_counts/sample_info.csv"
+venn_dir   <- "09_four_way_venn"
+de_dir     <- "05_annotate"
+out_dir    <- "10_expression_plots"
+dir.create(out_dir, showWarnings = FALSE)
+
+# =====================================================================
+# 2. 读取 Counts 矩阵并进行 VST
+# =====================================================================
+message("📦 正在加载底层矩阵并进行 VST 归一化...")
+
+data <- read.table(count_file, header=TRUE, sep="\t", quote="", stringsAsFactors=FALSE, check.names=FALSE)
+counts_raw <- data[, 8:ncol(data)]
+rownames(counts_raw) <- data$Gene_ID
+
+metadata <- read.csv(meta_file, stringsAsFactors = FALSE)
+metadata$True_Group <- factor(metadata$True_Group)
+
+metadata$Sample_ID <- sub("_L1_UDI.*", "", metadata$Sample_ID)
+metadata$Sample_ID <- sub("_merged$", "", metadata$Sample_ID)
+metadata$Group_Disp <- gsub("_plus_", "+_",as.character(metadata$True_Group))
+metadata$Group_Disp <- gsub("_minus_", "-_", metadata$Group_Disp)
+rownames(metadata) <- paste0(metadata$Group_Disp, ":", metadata$Sample_ID)
+counts_raw <- counts_raw[, rownames(metadata)]
+
+metadata$Arg_Status <- ifelse(grepl("plus", metadata$True_Group), "Arg+", "Arg-")
+metadata$Virus_Status <- gsub("Arg_plus_|Arg_minus_", "", metadata$True_Group)
+metadata$Virus_Status <- factor(metadata$Virus_Status, levels = c("mock", "LGTV", "SFTSV"), labels = c("Mock", "LGTV", "SFTSV"))
+
+dds <- DESeqDataSetFromMatrix(countData = counts_raw, colData = metadata, design = ~ True_Group)
+vsd <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vsd)
+
+# =====================================================================
+# 3. 预加载 DESeq2 的原始统计结果
+# =====================================================================
+message("🔍 正在预加载 DESeq2 原始数据池...")
+res_lgtv_v  <- read.csv(file.path(de_dir, "DE_LGTV_in_ArgPlus_Arg_plus_LGTV_vs_Arg_plus_mock.csv"), row.names = 1)
+res_sftsv_v <- read.csv(file.path(de_dir, "DE_SFTSV_in_ArgPlus_Arg_plus_SFTSV_vs_Arg_plus_mock.csv"), row.names = 1)
+res_lgtv_a  <- read.csv(file.path(de_dir, "DE_ArgPlus_vs_ArgMinus_in_LGTV_Arg_plus_LGTV_vs_Arg_minus_LGTV.csv"), row.names = 1)
+res_sftsv_a <- read.csv(file.path(de_dir, "DE_ArgPlus_vs_ArgMinus_in_SFTSV_Arg_plus_SFTSV_vs_Arg_minus_SFTSV.csv"), row.names = 1)
+
+format_p <- function(p) {
+  if (is.na(p)) return("ns")
+  if (p < 0.001) return("p < 0.001")
+  if (p > 0.05) return("ns")
+  return(paste0("p = ", signif(p, 2)))
+}
+
+# =====================================================================
+# 4. 核心绘图函数
+# =====================================================================
+plot_target_genes <- function(csv_file_name, prefix) {
+  target_file <- file.path(venn_dir, csv_file_name)
+  if (!file.exists(target_file)) return(NULL)
+  
+  df_target <- read.csv(target_file, row.names = 1, stringsAsFactors = FALSE)
+  genes <- rownames(df_target)
+  if (length(genes) == 0) return(NULL)
+  
+  message("\n🎨 正在为 [", prefix, "] 绘制终极版 SCI 表达图...")
+  
+  display_names <- sapply(genes, function(g) {
+    sym <- df_target[g, "Gene_Symbol"]
+    if (!is.na(sym) && sym != "" && sym != "-") return(sym) else return(g)
+  })
+  
+  expr_subset <- vst_matrix[genes, , drop = FALSE]
+  rownames(expr_subset) <- display_names
+  expr_long <- melt(expr_subset, varnames = c("Gene", "Sample"), value.name = "Expression")
+  expr_long$Arg_Status <- metadata[as.character(expr_long$Sample), "Arg_Status"]
+  expr_long$Virus_Status <- metadata[as.character(expr_long$Sample), "Virus_Status"]
+  
+  n_genes <- length(genes)
+  n_cols <- min(4, n_genes)
+  plot_h <- min(max(6, ceiling(n_genes / 4) * 4.5), 45)
+  
+  seg_h_list <- list()
+  seg_v_list <- list()
+  text_list <- list()
+  
+  for (g in genes) {
+    sym <- display_names[[g]]
+    y_base <- max(expr_long$Expression[expr_long$Gene == sym], na.rm = TRUE)
+    y_min <- min(expr_long$Expression[expr_long$Gene == sym], na.rm = TRUE)
+    y_range <- y_base - y_min
+    step <- y_range * 0.20  
+    tick <- y_range * 0.04
+    
+    # 提取预先跑好的 DESeq2 p 值
+    p_la <- format_p(res_lgtv_a[g, "pvalue"])
+    p_sa <- format_p(res_sftsv_a[g, "pvalue"])
+    p_lv <- format_p(res_lgtv_v[g, "pvalue"])
+    p_sv <- format_p(res_sftsv_v[g, "pvalue"])
+    
+    # 【重点新增】：实时计算 Mock 组内 Arg+ vs Arg- 的 P 值
+    mock_plus <- expr_long$Expression[expr_long$Gene == sym & expr_long$Virus_Status == "Mock" & expr_long$Arg_Status == "Arg+"]
+    mock_minus <- expr_long$Expression[expr_long$Gene == sym & expr_long$Virus_Status == "Mock" & expr_long$Arg_Status == "Arg-"]
+    p_ma_val <- tryCatch(t.test(mock_plus, mock_minus)$p.value, error = function(e) NA)
+    p_ma <- format_p(p_ma_val)
+    
+    # 构建 5 条精美的连线坐标 (Mock, LGTV, SFTSV 组内连线处于同一高度，互不打架)
+    coords <- list(
+      list(x1 = 0.8, x2 = 1.2, y = y_base + step * 0.8, label = p_ma), # 【新增】Mock: Arg- vs Arg+
+      list(x1 = 1.8, x2 = 2.2, y = y_base + step * 0.8, label = p_la), # LGTV: Arg- vs Arg+
+      list(x1 = 2.8, x2 = 3.2, y = y_base + step * 0.8, label = p_sa), # SFTSV: Arg- vs Arg+
+      list(x1 = 1.2, x2 = 2.2, y = y_base + step * 2.0, label = p_lv), # Arg+: Mock vs LGTV
+      list(x1 = 1.2, x2 = 3.2, y = y_base + step * 3.2, label = p_sv)  # Arg+: Mock vs SFTSV
+    )
+    
+    for (c in coords) {
+      seg_h_list[[length(seg_h_list) + 1]] <- data.frame(Gene = sym, x = c$x1, xend = c$x2, y = c$y, yend = c$y)
+      seg_v_list[[length(seg_v_list) + 1]] <- data.frame(Gene = sym, x = c$x1, xend = c$x1, y = c$y, yend = c$y - tick)
+      seg_v_list[[length(seg_v_list) + 1]] <- data.frame(Gene = sym, x = c$x2, xend = c$x2, y = c$y, yend = c$y - tick)
+      text_list[[length(text_list) + 1]] <- data.frame(Gene = sym, x = (c$x1 + c$x2) / 2, y = c$y + tick*2.0, label = c$label)
+    }
+  }
+  
+  df_seg_h <- do.call(rbind, seg_h_list)
+  df_seg_v <- do.call(rbind, seg_v_list)
+  df_text <- do.call(rbind, text_list)
+  
+  p_box <- ggplot(expr_long, aes(x = Virus_Status, y = Expression, fill = Arg_Status)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.8, lwd = 0.8, color = "black", 
+                 position = position_dodge(0.8), width = 0.6) +
+    geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), 
+               size = 1.2, color = "black", alpha = 0.5) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 2.5, 
+                 fill = "white", color = "black", stroke = 0.8,
+                 position = position_dodge(0.8)) +
+    geom_segment(data = df_seg_h, aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, size = 0.6) +
+    geom_segment(data = df_seg_v, aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, size = 0.6) +
+    geom_text(data = df_text, aes(x = x, y = y, label = label), inherit.aes = FALSE, size = 3.5, fontface = "italic") +
+    facet_wrap(~ Gene, scales = "free_y", ncol = n_cols) +
+    scale_fill_lancet() +
+    scale_y_continuous(expand = expansion(mult = c(0.1, 0.45))) +
+    theme_classic(base_size = 14) +
+    labs(x = "", y = "Normalized Expression (VST)", fill = "Arginine Status") +
+    theme(
+      strip.text = element_text(face = "bold", size = 13),
+      strip.background = element_rect(fill = "#f0f0f0", color = "black", linewidth = 0.8),
+      axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
+      axis.text = element_text(color = "black"),
+      axis.line = element_line(linewidth = 0.8),
+      axis.ticks = element_line(linewidth = 0.8),
+      legend.position = "top",
+      legend.title = element_text(face = "bold")
+    )
+  
+  ggsave(file.path(out_dir, paste0(prefix, "_Boxplot_SCI_Style.pdf")), p_box, width = max(8, n_cols * 3.5), height = plot_h)
+  message("  ✅ 成功生成全连线 SCI 图谱: ", prefix)
+}
+
+# =====================================================================
+# 5. 执行批量绘图
+# =====================================================================
+plot_target_genes("Target_1_LGTV_Virus_AND_LGTV_Arg.csv", "Target_1_LGTV")
+plot_target_genes("Target_2_SFTSV_Virus_AND_SFTSV_Arg.csv", "Target_2_SFTSV")
+plot_target_genes("Target_3_LGTV_Virus_AND_SFTSV_Virus.csv", "Target_3_Common_Virus")
+plot_target_genes("Target_4_Ultimate_All_Four.csv", "Target_4_Ultimate")
+
+message("\n🎉 殿堂级全比较基因表达图完美收官！恭喜完成！")
+```
 ## Phase 4: Advanced Likelihood Ratio Test (高级交互建模 LRT) ⭐核心⭐
 # 14_Ultimate_LRT_Engine.R
 ```
