@@ -216,6 +216,61 @@ cat ${MATRIX_DIR}/header.txt ${MATRIX_DIR}/raw_counts_matrix.txt > ${MATRIX_DIR}
 
 echo "🎉 ALL DONE! Ultimate Matrix saved at ${MATRIX_DIR}/final_counts.txt"
 ```
+
+## featureCounts
+#  3_featureCounts.sh
+```
+#!/bin/bash
+#PBS -N featureCounts_Quant
+#PBS -q batch
+#PBS -l nodes=1:ppn=24
+#PBS -l mem=50gb
+#PBS -V
+#PBS -o logs/featureCounts.out
+#PBS -e logs/featureCounts.err
+
+set -e
+
+BASE_DIR="/mnt/alamo01/users/yuansongwei7/IDE8-ARG--LGTV_SFTSV/FJLBFC20260490-01/FJLBFC20260490-01/analysis"
+BAM_DIR="${BASE_DIR}/03_alignment"
+GTF_FILE="${BASE_DIR}/reference/tick_annotation.gtf"
+OUT_DIR="${BASE_DIR}/04_counts"
+
+mkdir -p ${OUT_DIR}
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting featureCounts..."
+
+# ================= 核心修复部分 =================
+# 添加了 -B 参数：要求 Reads 必须双端都比对上才计数（更严谨）
+# 添加了 -C 参数：不统计那些两条 Reads 比对到不同染色体的“嵌合体”
+# 最重要的是：我们移除了 -p 带来的强制严格配对限制，对于某些组装碎片化的基因组（如蜱虫），这能挽救大量 Reads。
+# 我们还是先用 -s 0 测试。
+
+featureCounts -T 24 -p -B -C -t exon -g gene_id -s 0 \
+    -A reference/alias.txt \
+    -a ${GTF_FILE} \
+    -o ${OUT_DIR}/featureCounts_raw.txt \
+    ${BAM_DIR}/*Aligned.sortedByCoord.out.bam
+
+# ================= 清洗矩阵 =================
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleaning matrix format..."
+
+sed '1d' ${OUT_DIR}/featureCounts_raw.txt | head -n 1 | awk 'BEGIN{FS="\t"; OFS="\t"} {
+    printf "%s", "Gene_ID";
+    for(i=7; i<=NF; i++) {
+        n=split($i, a, "/");
+        sample=a[n];
+        sub("_Aligned.sortedByCoord.out.bam", "", sample);
+        printf "\t%s", sample;
+    }
+    print "";
+}' > ${OUT_DIR}/featureCounts_clean_matrix.txt
+
+tail -n +3 ${OUT_DIR}/featureCounts_raw.txt | cut -f1,7- >> ${OUT_DIR}/featureCounts_clean_matrix.txt
+
+echo "🎉 定量完成！
+"grep "Assigned" test_final.txt.summary
+```
 ## 注释
 #  7_annotate_matrix.py
 ```
